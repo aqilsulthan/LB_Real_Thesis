@@ -1,0 +1,10 @@
+services:
+  load-balancer:
+    build:
+      context: ./load_balancer
+      dockerfile: Dockerfile
+    container_name: load-balancer
+    ports:
+      - "38080:8080"
+    volumes:
+      - ./logs/:/logs/
