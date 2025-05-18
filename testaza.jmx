@@ -279,11 +279,11 @@
         </ResultCollector>
         <hashTree/>
       </hashTree>
-      <Arguments guiclass="ArgumentsPanel" testclass="Arguments" testname="Ubah algo" enabled="true">
+      <Arguments guiclass="ArgumentsPanel" testclass="Arguments" testname="Ubah algo">
         <collectionProp name="Arguments.arguments">
           <elementProp name="algo" elementType="Argument">
             <stringProp name="Argument.name">algo</stringProp>
-            <stringProp name="Argument.value">sahsh</stringProp>
+            <stringProp name="Argument.value">dalb</stringProp>
             <stringProp name="Argument.metadata">=</stringProp>
           </elementProp>
         </collectionProp>

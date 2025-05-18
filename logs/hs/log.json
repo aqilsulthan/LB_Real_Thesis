@@ -1,0 +1,22 @@
+[
+  {
+    "endpoint": "b",
+    "startTime": 1747451949477,
+    "waitTime": 1,
+    "executionTime": 325,
+    "finishTime": 1747451949803,
+    "server": "http://192.168.56.11:31001",
+    "algorithm": "hs",
+    "load": 302
+  },
+  {
+    "endpoint": "a",
+    "startTime": 1747472544283,
+    "waitTime": 3,
+    "executionTime": 133,
+    "finishTime": 1747472544419,
+    "server": "http://192.168.56.13:31006",
+    "algorithm": "hs",
+    "load": 128
+  }
+]

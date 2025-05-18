@@ -7,5 +7,35 @@
     "finishTime": 1746984212448,
     "server": "http://192.168.56.12:31004",
     "algorithm": "sa"
+  },
+  {
+    "endpoint": "a",
+    "startTime": 1747215912681,
+    "waitTime": 0,
+    "executionTime": 117,
+    "finishTime": 1747215912798,
+    "server": "http://192.168.56.13:31005",
+    "algorithm": "sa",
+    "load": 103
+  },
+  {
+    "endpoint": "a",
+    "startTime": 1747451914979,
+    "waitTime": 0,
+    "executionTime": 182,
+    "finishTime": 1747451915161,
+    "server": "http://192.168.56.12:31003",
+    "algorithm": "sa",
+    "load": 160
+  },
+  {
+    "endpoint": "a",
+    "startTime": 1747472538440,
+    "waitTime": 0,
+    "executionTime": 187,
+    "finishTime": 1747472538627,
+    "server": "http://192.168.56.11:31002",
+    "algorithm": "sa",
+    "load": 167
   }
 ]

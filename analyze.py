@@ -1,22 +1,32 @@
 import json
 import numpy as np
 import sys
+import os
 
-# Baca file log
-log_file = sys.argv[1] if len(sys.argv) > 1 else 'logs/sa-hs/log.json'
-try:
+valid_algos = ['sa', 'hs', 'sahsh', 'dalb']
+algo_arg = sys.argv[1] if len(sys.argv) > 1 else None
+
+logs_by_algo = {'sa': [], 'hs': [], 'sahsh': [], 'dalb': []}
+
+if algo_arg:
+    if algo_arg not in valid_algos:
+        print(f"Error: Invalid algorithm '{algo_arg}'. Must be one of: {', '.join(valid_algos)}")
+        exit(1)
+    log_file = f'logs/{algo_arg}/log.json'
+    if not os.path.exists(log_file):
+        print(f"Error: Log file for '{algo_arg}' not found at: {log_file}")
+        exit(1)
     with open(log_file, 'r') as f:
         log = json.load(f)
-except FileNotFoundError:
-    print(f"Error: {log_file} not found")
-    exit(1)
+    logs_by_algo[algo_arg] = log
+else:
+    # Baca semua log jika tidak diberi argumen
+    for algo in valid_algos:
+        path = f'logs/{algo}/log.json'
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                logs_by_algo[algo] = json.load(f)
 
-# Pisahkan log berdasarkan algoritma
-logs_by_algo = {'sa': [], 'hs': [], 'sahsh': []}
-for entry in log:
-    algo = entry.get('algorithm', 'sahsh')  # Default ke sahsh jika tidak ada
-    if algo in logs_by_algo:
-        logs_by_algo[algo].append(entry)
 
 # Daftar server
 server_list = [
@@ -73,16 +83,15 @@ for algo, entries in logs_by_algo.items():
 
 # Tampilkan hasil
 print("Perbandingan Performa per Algoritma:")
-print(f"{'Parameter':<25} {'SA':>15} {'HS':>15} {'SA-HS':>15}")
+print(f"{'Parameter':<25} {'SA':>15} {'HS':>15} {'SA-HS':>15} {'DALB':>15}")
 print("-" * 70)
 
-# Fungsi untuk format hasil
 def print_metric(label, key, unit="ms"):
     values = []
-    for algo in ['sa', 'hs', 'sahsh']:
+    for algo in ['sa', 'hs', 'sahsh', 'dalb']:
         value = results[algo][key] if results[algo] else 0
         values.append(f"{value:.2f}")
-    print(f"{label:<25} {values[0]:>15} {values[1]:>15} {values[2]:>15} {unit}")
+    print(f"{label:<25} {values[0]:>15} {values[1]:>15} {values[2]:>15} {values[3]:>15} {unit}")
 
 # Tampilkan metrik
 print_metric("Average Start Time", "avg_start_time")
@@ -94,17 +103,17 @@ print_metric("Imbalance Degree", "imbalance_degree", unit="")
 
 # Tampilkan jumlah request
 print("\nJumlah Request per Algoritma:")
-for algo in ['sa', 'hs', 'sahsh']:
+for algo in ['sa', 'hs', 'sahsh', 'dalb']:
     count = results[algo]['request_count'] if results[algo] else 0
     print(f"{algo.upper():<10} {count:>15}")
 
 # Tampilkan distribusi beban per server
 print("\nDistribusi Beban per Server (Execution Time, ms):")
-print(f"{'Server':<20} {'SA':>15} {'HS':>15} {'SA-HS':>15}")
+print(f"{'Server':<20} {'SA':>15} {'HS':>15} {'SA-HS':>15} {'DALB':>15}")
 print("-" * 70)
 for server in server_list:
     values = []
-    for algo in ['sa', 'hs', 'sahsh']:
+    for algo in ['sa', 'hs', 'sahsh', 'dalb']:
         value = results[algo]['server_times'][server] if results[algo] else 0
         values.append(f"{value:.2f}")
-    print(f"{server:<20} {values[0]:>15} {values[1]:>15} {values[2]:>15}")
+    print(f"{server:<20} {values[0]:>15} {values[1]:>15} {values[2]:>15} {values[3]:>15}")
