@@ -2,18 +2,17 @@ const express = require('express');
 const axios = require('axios').default;
 const fs = require('fs');
 const path = require('path');
+const gamma = require('gamma');
 const app = express();
 
-// Konfigurasi axios dengan timeout
 const axiosInstance = axios.create({
-    timeout: 35000,
+    timeout: 180000,
     headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json'
     }
 });
 
-// Daftar server (container) - akan diupdate dengan MIPS nyata
 const servers = [
     { url: 'http://192.168.56.11:31001', mips: 0, totalLoad: 0 },
     { url: 'http://192.168.56.11:31002', mips: 0, totalLoad: 0 },
@@ -23,258 +22,302 @@ const servers = [
     { url: 'http://192.168.56.13:31006', mips: 0, totalLoad: 0 }
 ];
 
-// Daftar endpoint yang valid
 const validEndpoints = ['a', 'b', 'c', 'd', 'e'];
-
-// Daftar algoritma yang valid
-const validAlgorithms = ['sa', 'hs', 'sahsh', 'dalb', 'fpa'];
-
-// Variabel untuk status keseimbangan
+const validAlgorithms = ['sahsh', 'dalb', 'dalevy', 'fpa', 'rr', 'aco', 'hs', 'sa', 'pso', 'ga']; // Tambahkan 'sa'
 let isBalanced = false;
+let rrIndex = 0;
 
-// Fungsi untuk mengambil MIPS nyata dari container
 async function fetchRealMips() {
     for (let server of servers) {
         try {
             const response = await axiosInstance.get(`${server.url}/mips`);
-            server.mips = response.data.mips || 500; // Fallback ke 500 jika gagal
+            server.mips = response.data.mips || 500;
             console.log(`Fetched Real MIPS for ${server.url}: ${server.mips}`);
         } catch (error) {
             console.error(`Error fetching MIPS for ${server.url}: ${error.message}`);
-            server.mips = 500; // Fallback jika gagal
+            server.mips = 500;
         }
     }
 }
 
-// Ambil MIPS nyata saat startup
 fetchRealMips().then(() => {
     console.log('MIPS fetching completed for all containers');
 });
 
-// Fungsi cost menggunakan MIPS nyata
 function cost(vm, task) {
     return (vm.totalLoad + task) / vm.mips;
 }
 
-// Fungsi untuk mendapatkan solusi acak
 function getRandomSolution(solutionList) {
     const idx = Math.floor(Math.random() * solutionList.length);
     return { ...solutionList[idx], totalLoad: 0 };
 }
 
-// Fungsi untuk menghitung rata-rata waktu pemrosesan
 function calculateAvgProcessingTime(solutionList) {
     const totalLoad = solutionList.reduce((sum, vm) => sum + vm.totalLoad, 0);
     return totalLoad / solutionList.length;
 }
 
-// Fungsi untuk menghitung standar deviasi
 function calculateStdDeviation(solutionList, avg) {
     const variance = solutionList.reduce((sum, vm) => sum + Math.pow(vm.totalLoad - avg, 2), 0) / solutionList.length;
     return Math.sqrt(variance);
 }
 
-// Algoritma Simulated Annealing
-function simulatedAnnealing(solutionList, task) {
-    let T = 1000; // Initial temperature sesuai dengan penyesuaian di SimulatedAnnealingLB.java
-    let alpha = 0.25;
-    let L = 3;
+// Hybrid SA-HS Algorithm based on HybridSAHSLB.java
+function hybridSAHS(vmList, task) {
+    const HMS = 5;
+    const HMCR = 0.9;
+    const PAR = 0.3;
+    const BW = 0.001;
+    const MAX_ITER = 1000;
+    const T0 = 1000;
+    const alpha = 0.95;
+    const L = 7;
 
-    let current = getRandomSolution(solutionList);
-    let currentCost = cost(current, task);
-    current.totalLoad = currentCost * current.mips;
-
-    while (T > 1e-3) {
-        for (let i = 0; i < L; i++) {
-            let neighbor = getRandomSolution(solutionList);
-            let neighborCost = cost(neighbor, task);
-            neighbor.totalLoad = neighborCost * neighbor.mips;
-
-            let delta = neighborCost - currentCost;
-            if (delta < 0 || Math.exp(-delta / T) > Math.random()) {
-                current = neighbor;
-                currentCost = neighborCost;
-            }
-        }
-        T *= alpha; // Pendinginan setiap L iterasi
+    function deepCloneSolution(solution) {
+        return solution.map(vm => ({ ...vm }));
     }
 
-    const selectedServer = servers.find(s => s.url === current.url);
-    selectedServer.totalLoad += task;
+    function generateRandomSolution() {
+        const solution = vmList.map(vm => ({ ...vm, totalLoad: vm.totalLoad }));
+        const index = Math.floor(Math.random() * solution.length);
+        solution[index].totalLoad += task;
+        return solution;
+    }
 
-    // Evaluasi keseimbangan
-    const avg = calculateAvgProcessingTime(servers);
-    const sd = calculateStdDeviation(servers, avg);
-    isBalanced = sd <= avg;
+    function calculateFitness(solution) {
+        const avg = calculateAvgProcessingTime(solution);
+        const sd = calculateStdDeviation(solution, avg);
+        return sd / avg; // imbalance degree
+    }
 
-    return selectedServer;
-}
+    function pitchAdjust(solution) {
+        const adjusted = deepCloneSolution(solution);
+        const idxFrom = Math.floor(Math.random() * adjusted.length);
+        let idxTo = Math.floor(Math.random() * adjusted.length);
+        while (idxTo === idxFrom) idxTo = Math.floor(Math.random() * adjusted.length);
 
-// Algoritma Harmony Search
-function harmonySearch(solutionList, task) {
-    const HMS = 10; // Sesuai HarmonySearchLB.java
-    const HMCR = 0.7; // Sesuai HarmonySearchLB.java
-    const PAR = 0.5; // Sesuai HarmonySearchLB.java
-    const BW = 0.05; // Sesuai HarmonySearchLB.java
-    const MAX_ITER = 500; // Sesuai HarmonySearchLB.java
+        if (adjusted[idxFrom].totalLoad >= task) {
+            adjusted[idxFrom].totalLoad -= task;
+            adjusted[idxTo].totalLoad += task;
+        }
+        return adjusted;
+    }
 
-    let harmonyMemory = [];
+    // Step 1: Initialize Harmony Memory
+    const harmonyMemory = [];
     for (let i = 0; i < HMS; i++) {
-        let vm = getRandomSolution(solutionList);
-        vm.fitness = cost(vm, task);
-        harmonyMemory.push(vm);
-    }
-
-    for (let iter = 0; iter < MAX_ITER; iter++) {
-        let newHarmony = { ...harmonyMemory[Math.floor(Math.random() * HMS)] };
-        let newFitness;
-
-        if (Math.random() < HMCR) {
-            let memoryVm = harmonyMemory[Math.floor(Math.random() * HMS)];
-            newHarmony = { ...memoryVm };
-
-            if (Math.random() < PAR) {
-                let adjustment = (Math.random() * 2 - 1) * BW;
-                let adjustedLoad = memoryVm.totalLoad + (memoryVm.mips * adjustment); // Sesuai dengan mips
-                newFitness = cost(newHarmony, adjustedLoad);
-            } else {
-                newFitness = cost(newHarmony, task);
-            }
-        } else {
-            newHarmony = getRandomSolution(solutionList);
-            newFitness = cost(newHarmony, task);
-        }
-
-        newHarmony.fitness = newFitness;
-        let worstIdx = harmonyMemory.reduce((idx, _, i, arr) => arr[i].fitness > arr[idx].fitness ? i : idx, 0);
-        if (newFitness < harmonyMemory[worstIdx].fitness) {
-            harmonyMemory[worstIdx] = newHarmony;
-        }
+        const solution = generateRandomSolution();
+        const fitness = calculateFitness(solution);
+        harmonyMemory.push({ solution, fitness });
     }
 
     let best = harmonyMemory[0];
-    for (let vm of harmonyMemory) {
-        if (vm.fitness < best.fitness) best = vm;
-    }
-
-    const selectedServer = servers.find(s => s.url === best.url);
-    selectedServer.totalLoad += task;
-
-    // Evaluasi keseimbangan
-    const avg = calculateAvgProcessingTime(servers);
-    const sd = calculateStdDeviation(servers, avg);
-    isBalanced = sd <= avg;
-
-    return selectedServer;
-}
-
-// Algoritma Hybrid SA-HS
-function hybridSAHS(task) {
-    let harmonyMemory = [];
-    for (let i = 0; i < HMS; i++) {
-        const vm = getRandomSolution(servers);
-        vm.fitness = calculateFitness(vm, task, servers);
-        harmonyMemory.push(vm);
+    for (let i = 1; i < HMS; i++) {
+        if (harmonyMemory[i].fitness < best.fitness) {
+            best = harmonyMemory[i];
+        }
     }
 
     let T = T0;
-    let best = { ...harmonyMemory[0] };
-    let bestFitness = best.fitness;
 
+    // Step 2: Iterations
     for (let iter = 0; iter < MAX_ITER; iter++) {
-        let newHarmony = { ...harmonyMemory[Math.floor(Math.random() * HMS)] };
-        let newFitness;
+        let newSolution;
 
         if (Math.random() < HMCR) {
-            const memoryVm = harmonyMemory[Math.floor(Math.random() * HMS)];
-            newHarmony = { ...memoryVm };
+            const memory = harmonyMemory[Math.floor(Math.random() * HMS)];
+            newSolution = deepCloneSolution(memory.solution);
 
             if (Math.random() < PAR) {
-                const adjustment = (Math.random() * 2 - 1) * BW;
-                const adjustedLoad = memoryVm.totalLoad + (memoryVm.mips * adjustment);
-                newFitness = calculateFitness(newHarmony, adjustedLoad, servers);
-            } else {
-                newFitness = calculateFitness(newHarmony, task, servers);
+                newSolution = pitchAdjust(newSolution);
             }
         } else {
-            newHarmony = getRandomSolution(servers);
-            newFitness = calculateFitness(newHarmony, task, servers);
+            newSolution = generateRandomSolution();
         }
 
-        newHarmony.fitness = newFitness;
+        const fitness = calculateFitness(newSolution);
+        const worstIdx = harmonyMemory.reduce((worst, curr, idx, arr) =>
+            curr.fitness > arr[worst].fitness ? idx : worst, 0
+        );
 
-        const worstIdx = harmonyMemory.reduce((idx, _, i, arr) => arr[i].fitness > arr[idx].fitness ? i : idx, 0);
-        const delta = newFitness - harmonyMemory[worstIdx].fitness;
-
+        const delta = fitness - harmonyMemory[worstIdx].fitness;
         if (delta < 0 || Math.random() < Math.exp(-delta / T)) {
-            harmonyMemory[worstIdx] = newHarmony;
-            if (newFitness < bestFitness) {
-                best = { ...newHarmony };
-                bestFitness = newFitness;
+            harmonyMemory[worstIdx] = { solution: newSolution, fitness };
+            if (fitness < best.fitness) {
+                best = { solution: deepCloneSolution(newSolution), fitness };
             }
         }
 
         if ((iter + 1) % L === 0) T *= alpha;
     }
 
-    // Rebalancing step
-    const selectedServer = rebalance(servers, task, best);
-    selectedServer.totalLoad += task;
+    // Step 3: Apply best solution back to original VM list
+    best.solution.forEach((vm, i) => {
+        vmList[i].totalLoad = vm.totalLoad;
+    });
 
-    return selectedServer;
+    isBalanced = best.fitness <= 0.1; // threshold bisa disesuaikan
+    return vmList.reduce((a, b) =>
+        (a.totalLoad / a.mips < b.totalLoad / b.mips ? a : b)
+    );
 }
 
-// Fungsi untuk menghitung fitness (digunakan oleh Hybrid SA-HS) dengan MIPS nyata
-function calculateFitness(vm, task, solutionList) {
-    const loadAfterAssignment = vm.totalLoad + task;
-    const processingTime = loadAfterAssignment / vm.mips;
+// Harmony Search Algorithm
+function harmonySearch(vmList, task) {
+    const HMS = 10; // Harmony Memory Size
+    const HMCR = 0.7; // Harmony Memory Considering Rate
+    const PAR = 0.5; // Pitch Adjustment Rate
+    const BW = 0.05; // Band Width
+    const MAX_ITER = 500;
 
-    // Simulasi penambahan task untuk menghitung avg dan sd
-    const originalLoad = vm.totalLoad;
-    vm.totalLoad += task;
-    const avgTime = calculateAvgProcessingTime(solutionList);
-    const sd = calculateStdDeviation(solutionList, avgTime);
-    vm.totalLoad = originalLoad; // Revert
+    function deepClone(solution) {
+        return solution.map(vm => ({ ...vm }));
+    }
 
-    return processingTime + sd * 0.5; // Sesuai dengan HybridSAHSLB.java
-}
+    function generateRandomSolution() {
+        const solution = vmList.map(vm => ({ ...vm, totalLoad: vm.totalLoad }));
+        const idx = Math.floor(Math.random() * solution.length);
+        solution[idx].totalLoad += task;
+        return solution;
+    }
 
-// Fungsi rebalancing
-function rebalance(solutionList, task, currentBest) {
-    const originalLoad = currentBest.totalLoad;
-    currentBest.totalLoad += task; // Temporarily assign task
+    function calculateFitness(solution) {
+        const avg = calculateAvgProcessingTime(solution);
+        const sd = calculateStdDeviation(solution, avg);
+        return sd / avg; // Imbalance degree
+    }
 
-    // Hitung imbalance (menggunakan standar deviasi sebagai metrik)
-    let avg = calculateAvgProcessingTime(solutionList);
-    let imbalance = calculateStdDeviation(solutionList, avg);
+    function pitchAdjust(solution) {
+        const adjusted = deepClone(solution);
+        const idxFrom = Math.floor(Math.random() * adjusted.length);
+        let idxTo = Math.floor(Math.random() * adjusted.length);
+        while (idxTo === idxFrom) idxTo = Math.floor(Math.random() * adjusted.length);
 
-    if (imbalance > 0.001) {
-        let minLoadVm = solutionList[0];
-        for (let vm of solutionList) {
-            if ((vm.totalLoad / vm.mips) < (minLoadVm.totalLoad / minLoadVm.mips)) {
-                minLoadVm = vm;
-            }
+        const transfer = Math.max(1, Math.round(task * 0.2));
+        if (adjusted[idxFrom].totalLoad >= transfer) {
+            adjusted[idxFrom].totalLoad -= transfer;
+            adjusted[idxTo].totalLoad += transfer;
         }
+        return adjusted;
+    }
 
-        // Revert dan coba assign ke minLoadVm
-        currentBest.totalLoad = originalLoad;
-        const minLoadOriginal = minLoadVm.totalLoad;
-        minLoadVm.totalLoad += task;
-        const newAvg = calculateAvgProcessingTime(solutionList);
-        const newImbalance = calculateStdDeviation(solutionList, newAvg);
+    // Initialize Harmony Memory
+    const harmonyMemory = [];
+    for (let i = 0; i < HMS; i++) {
+        const solution = generateRandomSolution();
+        const fitness = calculateFitness(solution);
+        harmonyMemory.push({ solution, fitness });
+    }
 
-        if (newImbalance < imbalance) {
-            return minLoadVm; // Better balance
-        } else {
-            minLoadVm.totalLoad = minLoadOriginal; // Revert
-            currentBest.totalLoad += task; // Restore
+    let best = harmonyMemory[0];
+    for (let i = 1; i < HMS; i++) {
+        if (harmonyMemory[i].fitness < best.fitness) {
+            best = harmonyMemory[i];
         }
     }
 
-    return currentBest;
+    // Main HS loop
+    for (let iter = 0; iter < MAX_ITER; iter++) {
+        let newSolution;
+
+        if (Math.random() < HMCR) {
+            const memory = harmonyMemory[Math.floor(Math.random() * HMS)];
+            newSolution = deepClone(memory.solution);
+
+            if (Math.random() < PAR) {
+                newSolution = pitchAdjust(newSolution);
+            }
+        } else {
+            newSolution = generateRandomSolution();
+        }
+
+        const fitness = calculateFitness(newSolution);
+        const worstIdx = harmonyMemory.reduce((worst, curr, idx, arr) =>
+            curr.fitness > arr[worst].fitness ? idx : worst, 0
+        );
+
+        if (fitness < harmonyMemory[worstIdx].fitness) {
+            harmonyMemory[worstIdx] = { solution: deepClone(newSolution), fitness };
+            if (fitness < best.fitness) {
+                best = { solution: deepClone(newSolution), fitness };
+            }
+        }
+    }
+
+    // Apply best solution back to original VM list
+    best.solution.forEach((vm, i) => {
+        vmList[i].totalLoad = vm.totalLoad;
+    });
+
+    isBalanced = best.fitness <= 0.1;
+    return vmList.reduce((a, b) => a.totalLoad / a.mips < b.totalLoad / b.mips ? a : b);
 }
 
-// Algoritma Dragonfly
+// Simulated Annealing Algorithm
+function simulatedAnnealing(vmList, task) {
+    let T = 2000;
+    const alpha = 0.25;
+    const L = 3;
+
+    function deepClone(solution) {
+        return solution.map(vm => ({ ...vm }));
+    }
+    function generateRandomSolution() {
+        const solution = vmList.map(vm => ({ ...vm, totalLoad: vm.totalLoad }));
+        const idx = Math.floor(Math.random() * solution.length);
+        solution[idx].totalLoad += task;
+        return solution;
+    }
+    function calculateFitness(solution) {
+        const avg = calculateAvgProcessingTime(solution);
+        const sd = calculateStdDeviation(solution, avg);
+        return sd / avg;
+    }
+    function neighbor(solution) {
+        const next = deepClone(solution);
+        const idxFrom = Math.floor(Math.random() * next.length);
+        let idxTo = Math.floor(Math.random() * next.length);
+        while (idxTo === idxFrom) idxTo = Math.floor(Math.random() * next.length);
+
+        const transfer = Math.max(1, Math.round(task * 0.2));
+        if (next[idxFrom].totalLoad >= transfer) {
+            next[idxFrom].totalLoad -= transfer;
+            next[idxTo].totalLoad += transfer;
+        }
+        return next;
+    }
+
+    let current = generateRandomSolution();
+    let currentFitness = calculateFitness(current);
+    let best = deepClone(current);
+    let bestFitness = currentFitness;
+
+    while (T > 1e-3) {
+        for (let i = 0; i < L; i++) {
+            const candidate = neighbor(current);
+            const candidateFitness = calculateFitness(candidate);
+            const delta = candidateFitness - currentFitness;
+            if (delta < 0 || Math.exp(-delta / T) > Math.random()) {
+                current = deepClone(candidate);
+                currentFitness = candidateFitness;
+                if (candidateFitness < bestFitness) {
+                    best = deepClone(candidate);
+                    bestFitness = candidateFitness;
+                }
+            }
+        }
+        T *= alpha;
+    }
+
+    best.forEach((vm, i) => {
+        vmList[i].totalLoad = vm.totalLoad;
+    });
+    isBalanced = bestFitness <= 0.1;
+    return vmList.reduce((a, b) => a.totalLoad / a.mips < b.totalLoad / b.mips ? a : b);
+}
+
+// DA BROWNIAN
 function dragonflyAlgorithm(solutionList, task) {
     const maxIterations = 500;
     const populationSize = 30;
@@ -291,7 +334,7 @@ function dragonflyAlgorithm(solutionList, task) {
     for (let iter = 0; iter < maxIterations; iter++) {
         const radius = initialRadius * (1 - iter / maxIterations);
         const w = 0.9 - (iter / maxIterations) * 0.7;
-        const s = 0.1, a = 0.1, c = 0.7, f = 1.0, e = 2.0;
+        const s = 0.1, a = 0.1, c = 0.7, f = 1.0, e = 3.0;
 
         for (let i = 0; i < populationSize; i++) {
             const fitness = calculateDAFitness(position[i], solutionList, task);
@@ -383,51 +426,178 @@ function randomGaussian() {
     let u = 0, v = 0;
     while (u === 0) u = Math.random();
     while (v === 0) v = Math.random();
-    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }
 
-// Fungsi Flower Pollination Algorithm (versi pure)
-function flowerPollinationAlgorithm(solutionList, task) {
-    const numFlowers = 80;
-    const maxGenerations = 100;
-    const switchProbability = 0.8;
+// DA LEVY
+function dragonflyLevyAlgorithm(solutionList, task) {
+    const maxIterations = 500;
+    const populationSize = 30;
+    const dimension = solutionList.length;
+    const initialRadius = 0.5;
 
-    const population = [];
-    for (let i = 0; i < numFlowers; i++) {
-        const vm = getRandomSolution(solutionList);
-        vm.assignment = i % solutionList.length;
-        population.push(vm);
-    }
+    const position = Array.from({ length: populationSize }, () => Array.from({ length: dimension }, () => Math.random()));
+    const velocity = Array.from({ length: populationSize }, () => Array(dimension).fill(0));
 
-    let best = population[0];
-    let bestFitness = cost(best, task);
+    let bestPosition = Array(dimension).fill(0);
+    let bestFitness = Infinity;
 
-    for (let gen = 0; gen < maxGenerations; gen++) {
-        for (let i = 0; i < population.length; i++) {
-            let newVm;
-            if (Math.random() < switchProbability) {
-                const beta = levyFlight();
-                const step = Math.floor(beta * (best.assignment - population[i].assignment));
-                const newIndex = (population[i].assignment + step + solutionList.length) % solutionList.length;
-                newVm = { ...solutionList[newIndex] };
-            } else {
-                const a = getRandomSolution(solutionList);
-                const b = getRandomSolution(solutionList);
-                const newIndex = Math.floor(((a.assignment + b.assignment) / 2) % solutionList.length);
-                newVm = { ...solutionList[newIndex] };
+    for (let iter = 0; iter < maxIterations; iter++) {
+        const radius = initialRadius * (1 - iter / maxIterations);
+        const w = 0.9 - (iter / maxIterations) * 0.7;
+        const s = 0.1, a = 0.1, c = 0.7, f = 1.0, e = 4.0;
+
+        for (let i = 0; i < populationSize; i++) {
+            const fitness = calculateDAFitness(position[i], solutionList, task);
+            if (fitness < bestFitness) {
+                bestFitness = fitness;
+                bestPosition = [...position[i]];
+            }
+        }
+
+        for (let i = 0; i < populationSize; i++) {
+            let S = Array(dimension).fill(0), A = Array(dimension).fill(0), C = Array(dimension).fill(0);
+            let neighborCount = 0;
+
+            for (let j = 0; j < populationSize; j++) {
+                if (i === j) continue;
+                const dist = Math.sqrt(position[i].reduce((sum, _, d) => sum + Math.pow(position[i][d] - position[j][d], 2), 0));
+                if (dist <= radius) {
+                    neighborCount++;
+                    for (let d = 0; d < dimension; d++) {
+                        S[d] += position[i][d] - position[j][d];
+                        A[d] += velocity[j][d];
+                        C[d] += position[j][d];
+                    }
+                }
             }
 
-            const newFitness = cost(newVm, task);
-            if (newFitness < bestFitness) {
-                best = newVm;
-                bestFitness = newFitness;
+            for (let d = 0; d < dimension; d++) {
+                if (neighborCount > 0) {
+                    S[d] /= neighborCount;
+                    A[d] /= neighborCount;
+                    C[d] = (C[d] / neighborCount) - position[i][d];
+                } else {
+                    velocity[i][d] = levyFlightStep(1.5);
+                }
+            }
+
+            for (let d = 0; d < dimension; d++) {
+                const F = bestPosition[d] - position[i][d];
+                const E = position[i][d] - bestPosition[d];
+                velocity[i][d] = s * S[d] + a * A[d] + c * C[d] + f * F + e * E + w * velocity[i][d];
+                position[i][d] += velocity[i][d];
+                position[i][d] = Math.min(1, Math.max(0, position[i][d]));
             }
         }
     }
 
-    const selectedServer = servers.find(s => s.url === best.url);
-    selectedServer.totalLoad += task;
-    return selectedServer;
+    let selectedIndex = -1;
+    let bestUtil = Infinity;
+
+    for (let i = 0; i < dimension; i++) {
+        if (bestPosition[i] > 0.5) {
+            const vm = solutionList[i];
+            const predicted = vm.totalLoad + task;
+            const util = predicted / vm.mips;
+            if (util < bestUtil) {
+                bestUtil = util;
+                selectedIndex = i;
+            }
+        }
+    }
+
+    if (selectedIndex === -1) {
+        selectedIndex = Math.floor(Math.random() * dimension);
+    }
+
+    const selected = solutionList[selectedIndex];
+    selected.totalLoad += task;
+    return selected;
+}
+
+function levyFlightStep(beta) {
+    const sigma = Math.pow(
+        (gamma(1 + beta) * Math.sin(Math.PI * beta / 2)) /
+        (gamma((1 + beta) / 2) * beta * Math.pow(2, (beta - 1) / 2)),
+        1 / beta
+    );
+
+    const u = randomGaussian() * sigma;
+    const v = randomGaussian();
+    return 0.01 * (u / Math.pow(Math.abs(v), 1 / beta));
+}
+
+// FPA
+function flowerPollinationAlgorithm(servers, task) {
+    const numFlowers = 50;
+    const maxGenerations = 100;
+    const switchProbability = 0.8;
+
+    const population = Array.from({ length: numFlowers }, () => {
+        return servers.map(vm => ({
+            ...vm,
+            totalLoad: vm.totalLoad
+        }));
+    });
+
+    let bestSolution = population[0];
+    let bestFitness = calculatePopulationFitness(bestSolution);
+
+    for (let gen = 0; gen < maxGenerations; gen++) {
+        for (let i = 0; i < population.length; i++) {
+            const current = population[i];
+            let candidate;
+
+            if (Math.random() < switchProbability) {
+                const beta = levyFlight();
+                const step = Math.floor(beta * servers.length);
+                const index = Math.abs(step % servers.length);
+
+                candidate = current.map((vm, idx) => ({
+                    ...vm,
+                    totalLoad: idx === index ? vm.totalLoad + task : vm.totalLoad
+                }));
+            } else {
+                const a = population[Math.floor(Math.random() * population.length)];
+                const b = population[Math.floor(Math.random() * population.length)];
+                const mid = Math.floor(((a.length + b.length) / 2) % servers.length);
+
+                candidate = current.map((vm, idx) => ({
+                    ...vm,
+                    totalLoad: idx === mid ? vm.totalLoad + task : vm.totalLoad
+                }));
+            }
+
+            const candidateFitness = calculatePopulationFitness(candidate);
+            const currentFitness = calculatePopulationFitness(current);
+
+            if (candidateFitness < currentFitness) {
+                population[i] = candidate;
+                if (candidateFitness < bestFitness) {
+                    bestSolution = candidate;
+                    bestFitness = candidateFitness;
+                }
+            }
+        }
+    }
+
+    const selected = bestSolution.reduce((a, b) =>
+        (a.totalLoad / a.mips < b.totalLoad / b.mips ? a : b)
+    );
+
+    const realServer = servers.find(s => s.url === selected.url);
+    realServer.totalLoad += task;
+
+    return realServer;
+}
+
+function calculatePopulationFitness(vmList) {
+    const avg = vmList.reduce((sum, vm) => sum + (vm.totalLoad / vm.mips), 0) / vmList.length;
+    const variance = vmList.reduce((sum, vm) =>
+        sum + Math.pow((vm.totalLoad / vm.mips) - avg, 2), 0
+    ) / vmList.length;
+    return Math.sqrt(variance);
 }
 
 function levyFlight() {
@@ -435,7 +605,7 @@ function levyFlight() {
     const sigma = Math.pow(
         (gamma(1 + beta) * Math.sin(Math.PI * beta / 2)) /
         (gamma((1 + beta) / 2) * beta * Math.pow(2, (beta - 1) / 2)),
-        1.0 / beta
+        1 / beta
     );
 
     const u = randomGaussian() * sigma;
@@ -443,75 +613,353 @@ function levyFlight() {
     return u / Math.pow(Math.abs(v), 1 / beta);
 }
 
-function gamma(x) {
-    const p = [
-        676.5203681218851,
-        -1259.1392167224028,
-        771.32342877765313,
-        -176.61502916214059,
-        12.507343278686905,
-        -0.13857109526572012,
-        9.9843695780195716e-6,
-        1.5056327351493116e-7
-    ];
+// ACO
+function antColonyOptimization(solutionList, task) {
+    const numAnts = 30;
+    const generations = 50;
+    const evaporationRate = 0.1;
+    const alpha = 1.0;
+    const beta = 2.0;
 
-    const g = 7;
-    if (x < 0.5) return Math.PI / (Math.sin(Math.PI * x) * gamma(1 - x));
-    x -= 1;
-    let a = 0.99999999999980993;
-    for (let i = 0; i < p.length; i++) {
-        a += p[i] / (x + i + 1);
+    const numVMs = solutionList.length;
+    const pheromone = Array.from({ length: 1 }, () => Array(numVMs).fill(1.0));
+
+    let globalBestIndex = null;
+    let globalBestFitness = Infinity;
+
+    for (let gen = 0; gen < generations; gen++) {
+        for (let k = 0; k < numAnts; k++) {
+            const selectedIndex = selectVmIndex(0, solutionList, pheromone, task);
+            const fitness = calculateFitnessACO([selectedIndex], solutionList, task);
+
+            if (fitness < globalBestFitness) {
+                globalBestFitness = fitness;
+                globalBestIndex = selectedIndex;
+            }
+        }
+
+        for (let j = 0; j < numVMs; j++) {
+            pheromone[0][j] *= (1.0 - evaporationRate);
+            if (pheromone[0][j] < 0.0001) pheromone[0][j] = 0.0001;
+        }
+
+        pheromone[0][globalBestIndex] += 1.0 / (1.0 + globalBestFitness);
     }
-    const t = x + g + 0.5;
-    return Math.sqrt(2 * Math.PI) * Math.pow(t, x + 0.5) * Math.exp(-t) * a;
+
+    const selected = solutionList[globalBestIndex];
+    selected.totalLoad += task;
+    return selected;
 }
 
-// Parameter Hybrid SA-HS
-const HMS = 5;
-const HMCR = 0.9;
-const PAR = 0.3;
-const BW = 0.001;
-const MAX_ITER = 1000;
-const T0 = 1000;
-const alpha = 0.95;
-const L = 7;
+function selectVmIndex(cloudletIndex, vms, pheromone, task) {
+    const numVMs = vms.length;
+    const probabilities = [];
+    let sum = 0.0;
 
-// Endpoint untuk menerima permintaan API dengan pemilihan algoritma
+    for (let j = 0; j < numVMs; j++) {
+        const pher = Math.pow(pheromone[cloudletIndex][j], 1.0);
+        const heuristic = Math.pow(vms[j].mips / (task || 1), 2.0);
+        const prob = pher * heuristic;
+        probabilities.push(prob);
+        sum += prob;
+    }
+
+    if (sum === 0) return Math.floor(Math.random() * numVMs);
+
+    const rand = Math.random() * sum;
+    let cumulative = 0;
+    for (let j = 0; j < numVMs; j++) {
+        cumulative += probabilities[j];
+        if (rand <= cumulative) return j;
+    }
+    return numVMs - 1;
+}
+
+function calculateFitnessACO(solution, vms, task) {
+    const vmLoads = Array(vms.length).fill(0);
+
+    for (let i = 0; i < solution.length; i++) {
+        const vmIdx = solution[i];
+        vmLoads[vmIdx] += task;
+    }
+
+    const avg = vmLoads.reduce((a, b) => a + b, 0) / vms.length;
+    const max = Math.max(...vmLoads);
+    return max - avg;
+}
+
+// ROUND ROBIN
+let simpleRRCounter = 0;
+
+function roundRobin(task) {
+    const index = simpleRRCounter % servers.length;
+    const selected = servers[index];
+    selected.totalLoad += task;
+    simpleRRCounter++;
+    return selected;
+}
+
+// PSO
+function particleSwarmOptimization(vmList, task) {
+    const MAX_ITER = 50;
+    const SWARM_SIZE = 30;
+    const C1 = 2.0;
+    const C2 = 2.0;
+
+    const vmCount = vmList.length;
+    const position = new Array(SWARM_SIZE).fill(0).map(() => [Math.floor(Math.random() * vmCount)]);
+    const velocity = new Array(SWARM_SIZE).fill(0).map(() => [Math.floor(Math.random() * vmCount) - Math.floor(vmCount / 2)]);
+
+    const pBest = position.map(p => [...p]);
+    const pBestFitness = pBest.map(p => calculateFitnessPSO(vmList, p[0], task));
+
+    let gBest = [...pBest[0]];
+    let gBestFitness = pBestFitness[0];
+
+    for (let i = 1; i < SWARM_SIZE; i++) {
+        if (pBestFitness[i] < gBestFitness) {
+            gBest = [...pBest[i]];
+            gBestFitness = pBestFitness[i];
+        }
+    }
+
+    for (let iter = 0; iter < MAX_ITER; iter++) {
+        for (let i = 0; i < SWARM_SIZE; i++) {
+            const r1 = Math.random();
+            const r2 = Math.random();
+
+            velocity[i][0] = Math.round(
+                velocity[i][0]
+                + C1 * r1 * (pBest[i][0] - position[i][0])
+                + C2 * r2 * (gBest[0] - position[i][0])
+            );
+
+            position[i][0] += velocity[i][0];
+
+            if (position[i][0] < 0) position[i][0] = 0;
+            if (position[i][0] >= vmCount) position[i][0] = vmCount - 1;
+
+            const fitness = calculateFitnessPSO(vmList, position[i][0], task);
+
+            if (fitness < pBestFitness[i]) {
+                pBest[i][0] = position[i][0];
+                pBestFitness[i] = fitness;
+
+                if (fitness < gBestFitness) {
+                    gBest = [...pBest[i]];
+                    gBestFitness = fitness;
+                }
+            }
+        }
+    }
+
+    // Update selected VM's load
+    const selectedVm = vmList[gBest[0]];
+    selectedVm.totalLoad += task;
+
+    return selectedVm;
+}
+
+function calculateFitnessPSO(vmList, selectedIndex, task) {
+    const loads = vmList.map(vm => vm.totalLoad);
+    loads[selectedIndex] += task;
+
+    return Math.max(...loads); // minimize makespan
+}
+
+// GA
+// function geneticLoadBalancer(vmList, task) {
+//     const POPULATION_SIZE = 20;
+//     const MAX_GENERATIONS = 50;
+//     const CROSSOVER_RATE = 0.8;
+//     const MUTATION_RATE = 0.1;
+
+//     const vmCount = vmList.length;
+//     const population = [];
+
+//     // Step 1: Initialize population
+//     for (let i = 0; i < POPULATION_SIZE; i++) {
+//         const vmIndex = Math.floor(Math.random() * vmCount);
+//         const fit = fitnessGA(vmList, vmIndex, task);
+//         population.push({ vmIndex, fitness: fit });
+//     }
+
+//     // Step 2: Evolution loop
+//     for (let gen = 0; gen < MAX_GENERATIONS; gen++) {
+//         const newPopulation = [];
+
+//         while (newPopulation.length < POPULATION_SIZE) {
+//             const parent1 = selectChromosome(population);
+//             const parent2 = selectChromosome(population);
+
+//             if (Math.random() < CROSSOVER_RATE) {
+//                 const offspringIndex = Math.floor((parent1.vmIndex + parent2.vmIndex) / 2);
+//                 const boundedIndex = Math.min(vmCount - 1, Math.max(0, offspringIndex));
+//                 const fit = fitnessGA(vmList, boundedIndex, task);
+//                 newPopulation.push({ vmIndex: boundedIndex, fitness: fit });
+//             } else {
+//                 newPopulation.push({ vmIndex: parent1.vmIndex, fitness: parent1.fitness });
+//             }
+//         }
+
+//         // Mutation
+//         for (const ch of newPopulation) {
+//             if (Math.random() < MUTATION_RATE) {
+//                 ch.vmIndex = Math.floor(Math.random() * vmCount);
+//                 ch.fitness = fitnessGA(vmList, ch.vmIndex, task);
+//             }
+//         }
+
+//         population.length = 0;
+//         population.push(...newPopulation);
+//     }
+
+//     // Step 3: Return best solution
+//     const best = population.reduce((a, b) => (a.fitness < b.fitness ? a : b));
+//     const selectedVm = vmList[best.vmIndex];
+//     selectedVm.totalLoad += task;
+
+//     return selectedVm;
+// }
+
+// function selectChromosome(population) {
+//     return population[Math.floor(Math.random() * population.length)];
+// }
+
+// function fitnessGA(vmList, selectedIndex, task) {
+//     const loads = vmList.map(vm => vm.totalLoad);
+//     loads[selectedIndex] += task;
+//     return Math.max(...loads); // minimize makespan
+// }
+
+function geneticLoadBalancer(vmList, task) {
+    const POP_SIZE = 30;
+    const MAX_GEN = 50;
+    const CROSSOVER_RATE = 0.8;
+    const MUTATION_RATE = 0.1;
+
+    // Pastikan task diperlakukan sebagai array (meskipun cuma satu angka)
+    const taskArray = [task];  // Konversi scalar ke array
+    const taskCount = taskArray.length;
+    const vmCount = vmList.length;
+
+    // 1. Inisialisasi populasi
+    let population = [];
+    for (let i = 0; i < POP_SIZE; i++) {
+        const assignment = Array.from({ length: taskCount }, () => Math.floor(Math.random() * vmCount));
+        const fitness = evaluateFitness(assignment, vmList, taskArray);
+        population.push({ assignment, fitness });
+    }
+
+    // 2. Evolusi
+    for (let gen = 0; gen < MAX_GEN; gen++) {
+        const newPopulation = [];
+
+        while (newPopulation.length < POP_SIZE) {
+            const p1 = select(population);
+            const p2 = select(population);
+            let child = { assignment: [...p1.assignment] };
+
+            // Crossover 1-point
+            if (Math.random() < CROSSOVER_RATE) {
+                const point = Math.floor(Math.random() * taskCount);
+                child.assignment = p1.assignment.slice(0, point).concat(p2.assignment.slice(point));
+            }
+
+            // Mutasi
+            for (let t = 0; t < taskCount; t++) {
+                if (Math.random() < MUTATION_RATE) {
+                    child.assignment[t] = Math.floor(Math.random() * vmCount);
+                }
+            }
+
+            child.fitness = evaluateFitness(child.assignment, vmList, taskArray);
+            newPopulation.push(child);
+        }
+
+        population = newPopulation;
+    }
+
+    // 3. Pilih solusi terbaik
+    const best = population.reduce((a, b) => (a.fitness < b.fitness ? a : b));
+    const bestAssignment = best.assignment;
+
+    // 4. Terapkan hasilnya ke VM
+    for (let i = 0; i < taskCount; i++) {
+        const selectedVm = vmList[bestAssignment[i]];
+        selectedVm.totalLoad += taskArray[i];
+        return selectedVm; // kembalikan satu VM (karena cuma satu task)
+    }
+
+    // Fallback: kalau gagal
+    return vmList[0];
+}
+
+function select(population) {
+    return population[Math.floor(Math.random() * population.length)];
+}
+
+function evaluateFitness(assignment, vmList, tasks) {
+    const vmLoads = Array(vmList.length).fill(0);
+    for (let i = 0; i < assignment.length; i++) {
+        vmLoads[assignment[i]] += tasks[i];
+    }
+    const maxLoad = Math.max(...vmLoads);
+    const avgLoad = vmLoads.reduce((a, b) => a + b, 0) / vmLoads.length;
+    return maxLoad - avgLoad;
+}
+
+
+
+
 app.get('/api/:endpoint', async (req, res) => {
     const endpoint = req.params.endpoint;
-    const algo = req.query.algo || 'sahsh'; // Default ke Hybrid SA-HS jika ada
+    const algo = req.query.algo || 'sahsh';
 
-    // Validasi endpoint
     if (!validEndpoints.includes(endpoint)) {
         return res.status(400).json({ error: 'Invalid endpoint', details: 'Endpoint must be one of: a, b, c, d, e' });
     }
 
-    // Validasi parameter algo
     if (!req.query.algo || !validAlgorithms.includes(algo.toLowerCase())) {
-        return res.status(400).json({ error: 'Invalid or missing algorithm', details: 'Algorithm must be one of: sa, hs, sahsh, dalb, fpa' });
+        return res.status(400).json({ error: 'Invalid or missing algorithm', details: 'Algorithm must be one of: sahsh, dalb, dalevy, fpa, rr, aco, hs, sa, pso, ga' });
     }
 
     const startTime = Date.now();
     let targetServer;
 
-    // Pilih algoritma berdasarkan query parameter
     switch (algo.toLowerCase()) {
-        case 'sa':
-            targetServer = simulatedAnnealing(servers, 0); // Task akan diambil dari respons
-            break;
-        case 'hs':
-            targetServer = harmonySearch(servers, 0);
-            break;
         case 'sahsh':
-        default:
-            targetServer = hybridSAHS(0);
+            targetServer = hybridSAHS(servers, 0);
             break;
         case 'dalb':
             targetServer = dragonflyAlgorithm(servers, 0);
             break;
+        case 'dalevy':
+            targetServer = dragonflyLevyAlgorithm(servers, 0);
+            break;
         case 'fpa':
             targetServer = flowerPollinationAlgorithm(servers, 0);
             break;
+        case 'rr':
+            targetServer = roundRobin(0);
+            break;
+        case 'pso':
+            targetServer = particleSwarmOptimization(servers, 0);
+            break;
+        case 'ga':
+            targetServer = geneticLoadBalancer(servers, 0);
+            break;
+        case 'aco':
+            targetServer = antColonyOptimization(servers, 0);
+            break;
+        case 'hs':
+            targetServer = harmonySearch(servers, 0);
+            break;
+        case 'sa':
+            targetServer = simulatedAnnealing(servers, 0);
+            break;
+        default:
+            targetServer = hybridSAHS(servers, 0);
     }
 
     const waitTime = Date.now() - startTime;
@@ -526,15 +974,12 @@ app.get('/api/:endpoint', async (req, res) => {
             throw new Error('Invalid JSON response from server');
         }
 
-        // Ambil load nyata dari respons aplikasi (processingTime * MIPS)
         const task = response.data.load || executionTime * targetServer.mips;
 
-        // Perbarui totalLoad server dengan load nyata
         targetServer.totalLoad += task;
 
         console.log(`[${algo.toUpperCase()}] Response from ${targetServer.url}:`, JSON.stringify(response.data));
 
-        // Tentukan path log berdasarkan algoritma
         const logDir = path.join('/logs', algo.toLowerCase());
         const logFile = path.join(logDir, 'log.json');
         const errorLogFile = path.join(logDir, 'error.log');
@@ -549,7 +994,6 @@ app.get('/api/:endpoint', async (req, res) => {
             algorithm: algo,
             load: task,
             mips: targetServer.mips,
-            isBalanced: isBalanced
         };
 
         let log = [];
@@ -580,7 +1024,6 @@ app.get('/api/:endpoint', async (req, res) => {
     }
 });
 
-// Tangani /api/ (tanpa endpoint)
 app.get('/api/', (req, res) => {
     res.status(400).json({ error: 'Invalid endpoint', details: 'Endpoint must be one of: a, b, c, d, e' });
 });
